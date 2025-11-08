@@ -1,0 +1,432 @@
+import fs from "fs-extra"
+import path from "path"
+import zlib from "zlib"
+import md5 from "md5"
+import { SmartBuffer } from "smart-buffer"
+import { PESection, WindowsIcon, Icon } from "./icon"
+import { GameConfig, GameData, GameVersion } from "./gamedata"
+import { GM80 } from "./gamedata/gm80"
+import { Settings } from "./settings"
+import { Asset } from "./asset"
+import { Extension } from "./asset/extension"
+import { Trigger } from "./asset/trigger"
+import { Constant } from "./asset/constant"
+import { Sound } from "./asset/sound"
+import { Sprite } from "./asset/sprite"
+import { Background } from "./asset/background"
+import { Path } from "./asset/path"
+import { Script } from "./asset/script"
+import { Font } from "./asset/font"
+import { Timeline } from "./asset/timeline"
+import { GMObject } from "./asset/object"
+import { Room } from "./asset/room"
+import { IncludedFile } from "./asset/includedfile"
+import { GMLCode } from "./getGMLCode"
+import { Utils, Ports } from "./utils"
+
+export const ConverterGM8 = async function(input: string, gameName: string, server: string, ports: Ports): Promise<void> {
+	console.log("Reading file...");
+	const exe: SmartBuffer = SmartBuffer.fromBuffer(await fs.readFile(input));
+	if(exe.readString(2) != "MZ")
+		throw new Error("Invalid exe header");
+	exe.readOffset = 0x3C;
+	exe.readOffset = exe.readUInt32LE();
+	if(exe.readString(6) != "PE\0\0\x4C\x01")
+		throw new Error("Invalid PE header");
+	const sectionCount: number = exe.readUInt16LE();
+	exe.readOffset += 12;
+	const optionalLength: number = exe.readUInt16LE();
+	exe.readOffset += optionalLength+2;
+	let upx0VirtualLength: number = null;
+	let upx1Data: [number, number] = null;
+	// let rsrcLocation: number = null;
+	const sections: Array<PESection> = [];
+	for(let i: number = 0; i < sectionCount; ++i){
+		let sectionName: Buffer = exe.readBuffer(8);
+		const virtualSize: number = exe.readUInt32LE();
+		const virtualAddress: number = exe.readUInt32LE();
+		const diskSize: number = exe.readUInt32LE();
+		const diskAddress: number = exe.readUInt32LE();
+		exe.readOffset += 16;
+		if(sectionName.compare(Buffer.from([0x55, 0x50, 0x58, 0x30, 0x00, 0x00, 0x00, 0x00])) == 0)
+			upx0VirtualLength = virtualSize;
+		if(sectionName.compare(Buffer.from([0x55, 0x50, 0x58, 0x31, 0x00, 0x00, 0x00, 0x00])) == 0)
+			upx1Data = [virtualSize, diskAddress];
+		// if(sectionName.compare(Buffer.from([0x2E, 0x72, 0x73, 0x72, 0x63, 0x00, 0x00, 0x00])) == 0)
+		// 	rsrcLocation = diskAddress;
+		sections.push({
+			virtualSize: virtualSize,
+			virtualAddress: virtualAddress,
+			diskSize: diskSize,
+			diskAddress: diskAddress,
+		});
+	}
+	// let iconData: Array<WindowsIcon> = [];
+	// let icoFileRaw: Array<number> = [];
+	// if(rsrcLocation !== null){
+	// 	const readOffsetBackup = exe.readOffset;
+	// 	exe.readOffset = rsrcLocation;
+	// 	[iconData, icoFileRaw] = Icon.find(exe, sections);
+	// 	exe.readOffset = readOffsetBackup;
+	// 	await Icon.save(iconData, path.join(__dirname, "tests", "issou"));
+	// }
+	let upxData: [number, number] = null;
+	if(upx0VirtualLength !== null && upx1Data !== null)
+		upxData = [upx0VirtualLength+upx1Data[0], upx1Data[1]];
+	console.log("Decrypting...");
+	const gameConfig: GameConfig = GameData.decrypt(exe, upxData);
+	const settingsLength: number = exe.readUInt32LE();
+	const settingsStart: number = exe.readOffset;
+	const settings: Settings = Settings.load(exe, gameConfig, settingsStart, settingsLength);
+	settings.showErrorMessage = true;
+	settings.alwaysAbort = false;
+	settings.treatCloseAsEsc = true;
+	settings.logErrors = false;
+	settings.dontShowButtons = false;
+	settings.f4FullscreenToggle = true;
+	settings.allowResize = true;
+	settings.scaling = -1;
+	settings.displayCursor = true;
+	const dllNameLength: number = exe.readUInt32LE();
+	exe.readOffset += dllNameLength;
+	const dxDll: Array<number> = [...exe.readBuffer(exe.readUInt32LE())];
+	const encryptionStartGM80: number = exe.readOffset;
+	const uniqueKey: string = GM80.decrypt(exe);
+	const garbageDWords = exe.readUInt32LE();
+	exe.readOffset += garbageDWords*4;
+	exe.writeOffset = exe.readOffset;
+	exe.writeUInt32LE(Number(true));
+	const proFlag: boolean = exe.readUInt32LE() != 0;
+	const gameID: number = exe.readUInt32LE();
+	const guid: [number, number, number, number] = [
+		exe.readUInt32LE(),
+		exe.readUInt32LE(),
+		exe.readUInt32LE(),
+		exe.readUInt32LE(),
+	];
+	const getAssetRefs = function(src: SmartBuffer): Array<Buffer> {
+		const count: number = src.readUInt32LE();
+		const refs: Array<Buffer> = new Array(count);
+		for(let i: number = 0; i < count; ++i){
+			const length: number = src.readUInt32LE();
+			const data: Buffer = src.readBuffer(length);
+			refs[i] = data;
+		}
+		return refs;
+	}
+	const getAssets = function(src: SmartBuffer, deserializer: (data: SmartBuffer, version: GameConfig) => Asset): Array<Asset> {
+		const toAsset = function(ch: Buffer): Asset {
+			const data: Buffer = zlib.inflateSync(ch);
+			if(data.length < 4)
+				throw new Error("Malformed data");
+			if(data.slice(0, 4).compare(Buffer.from([0, 0, 0, 0])) == 0)
+				return null;
+			const sBuffer: SmartBuffer = SmartBuffer.fromBuffer(data.slice(4));
+			const asset: Asset = deserializer(sBuffer, gameConfig);
+			sBuffer.destroy();
+			return asset;
+		}
+		return getAssetRefs(src).map(toAsset);
+	}
+
+	const putAssetRefs = function(exe: SmartBuffer, assets: Array<Asset>): Buffer {
+		const data: SmartBuffer = new SmartBuffer();
+		data.writeUInt32LE(assets.length);
+		for(let i: number = 0, n: number = assets.length; i < n; i++){
+			const tmpData: SmartBuffer = new SmartBuffer();
+			tmpData.writeOffset = 0;
+			tmpData.readOffset = 0;
+			const asset: Asset = assets.shift();
+			asset.serialize(tmpData);
+			const tmpData2: Buffer = zlib.deflateSync(tmpData.toBuffer());
+			tmpData.destroy();
+			data.writeUInt32LE(tmpData2.length);
+			data.writeBuffer(tmpData2);
+		}
+		return data.toBuffer();
+	}
+
+	const putAssets = function(exe: SmartBuffer, assets: Array<Asset>): Buffer {
+		const data: SmartBuffer = new SmartBuffer();
+		data.writeUInt32LE(assets.length);
+		for(let i: number = 0, n: number = assets.length; i < n; ++i){
+			const tmpData: SmartBuffer = new SmartBuffer();
+			tmpData.writeOffset = 0;
+			tmpData.readOffset = 0;
+			const asset: Asset = assets.shift();
+			if(asset !== null){
+				tmpData.writeBuffer(Buffer.from([1, 0, 0, 0]));
+				asset.serialize(tmpData);
+			}else{
+				tmpData.writeBuffer(Buffer.from([0, 0, 0, 0]));
+			}
+			const tmpData2: Buffer = zlib.deflateSync(tmpData.toBuffer());
+			tmpData.destroy();
+			data.writeUInt32LE(tmpData2.length);
+			data.writeBuffer(tmpData2);
+		}
+		return data.toBuffer();
+	}
+	const replaceChunk = function(exe: SmartBuffer, offsets: [number, number], newData: Buffer): void {
+		const part1: Buffer = exe.toBuffer().subarray(0, offsets[0]);
+		const part2: Buffer = exe.toBuffer().subarray(offsets[1], exe.length);
+		exe.clear();
+		exe.writeOffset = 0;
+		exe.writeBuffer(Buffer.from([...part1, ...newData, ...part2]));
+		exe.readOffset = part1.length+newData.length;
+		exe.writeOffset = exe.readOffset;
+	}
+	const findAsset = function(assets: Array<Asset>, names: Array<string>): Asset {
+		let result: Asset;
+		for(let i: number = 0; i < names.length; ++i){
+			result = assets.filter(asset => asset && asset["name"].equals(Buffer.from(names[i], 'ascii')))[0];
+			if(result !== undefined)
+				break;
+		}
+		return result;
+	}
+	const insertGMLScript = function(source: Buffer, code: Buffer) {
+		// For scripts surrounded by `{}`, cannot append directly
+		if(/^\s*\{[\s\S]+\}\s*$/m.test(source.toString('ascii'))) {
+			let idx = source.lastIndexOf(Buffer.from("}",'ascii'))
+			return Buffer.concat([source.slice(0,idx),Buffer.from("\n", 'ascii'),code,Buffer.from("}",'ascii')])
+		}
+		return Buffer.concat([source,code]);
+	}
+	console.log("Reading game data...");
+	if(exe.readUInt32LE() != 700)
+		throw new Error("Extensions header");
+	const extensionCountPos: number = exe.readOffset;
+	const extensionCount: number = exe.readUInt32LE();
+	let extensions: Array<Extension> = new Array(extensionCount);
+	let hasWindowsDialogs: boolean = false;
+	let hasGm82net: boolean = false;
+	let hasGm82snd: boolean = false;
+	let hasGm8FoxWriting: boolean = false;
+	for(let i: number = 0; i < extensionCount; ++i){
+		extensions[i] = Extension.read(exe);
+		if(extensions[i].name.equals(Buffer.from("GM Windows Dialogs", 'ascii')))
+			hasWindowsDialogs = true;
+		if((extensions[i].name.equals(Buffer.from("Game Maker 8.2 Network", 'ascii'))) || extensions[i].name.equals(Buffer.from("Game Maker 8.2 Networking", 'ascii')) || extensions[i].name.equals(Buffer.from("Game Maker 8.2 Networking S", 'ascii')))
+			hasGm82net = true;
+		if((extensions[i].name.equals(Buffer.from("Game Maker 8.2 Sound"))) || (extensions[i].name.equals(Buffer.from("Game Maker 8.2 Sound S"))))
+			hasGm82snd = true;
+		if(extensions[i].name.equals(Buffer.from("Noisyfox's Writing", 'ascii')) && extensions[i].folderName.equals(Buffer.from("fw", 'ascii')))
+			hasGm8FoxWriting = true;
+		if(extensions[i].name.equals(Buffer.from("Http Dll 2.3", 'ascii')) && extensions[i].folderName.equals(Buffer.from("http_dll_2_3", 'ascii')))
+			throw new Error("This game is already an online version");
+	}
+	const addExtension = async function(exe: SmartBuffer, extensions: Array<Extension>, file: string): Promise<void> {
+		const pos: number = exe.readOffset;
+		const part1: Buffer = exe.toBuffer().subarray(0, pos);
+		const part2: Buffer = await fs.readFile(path.join(__dirname, "lib", file));
+		const part3: Buffer = exe.toBuffer().subarray(pos, exe.length);
+		exe.clear();
+		exe.writeOffset = 0;
+		exe.writeBuffer(Buffer.from([...part1, ...part2, ...part3]));
+		exe.readOffset = pos+part2.length;
+		extensions.push(null);
+	}
+	if(!hasWindowsDialogs)
+		await addExtension(exe, extensions, "gm_windows_dialog8");
+	if(!hasGm82net)
+		await addExtension(exe, extensions, "http_dll8");
+	if (!hasGm8FoxWriting && gameConfig.version === GameVersion.GameMaker80)
+		await addExtension(exe, extensions, "ChineseChatSupport8");
+
+	exe.writeOffset = extensionCountPos;
+	exe.writeUInt32LE(extensions.length);
+	extensions = null;
+	if(exe.readUInt32LE() != 800)
+		throw new Error("Triggers header");
+	let triggers: Array<Trigger> = getAssets(exe, Trigger.deserialize) as Array<Trigger>;
+	triggers = null;
+	if(exe.readUInt32LE() != 800)
+		throw new Error("Constants header");
+	const constantCount: number = exe.readUInt32LE();
+	const constants: Array<Constant> = new Array(constantCount);
+	for(let i: number = 0; i < constantCount; ++i){
+		const name: Buffer = exe.readBuffer(exe.readUInt32LE());
+		const expression: Buffer = exe.readBuffer(exe.readUInt32LE());
+		constants[i] = {
+			name: name,
+			expression: expression,
+		}
+	}
+	if(exe.readUInt32LE() != 800)
+		throw new Error("Sounds header");
+	const soundsOffsets: [number, number] = [exe.readOffset, 0];
+	let sounds: Array<Sound> = getAssets(exe, Sound.deserialize) as Array<Sound>;
+	soundsOffsets[1] = exe.readOffset;
+	const newSound = async function(sounds: Array<Sound>, file: string): Promise<void> {
+		const sound: Sound = new Sound();
+		sound.name = Buffer.from(file, 'ascii');
+		sound.content = await fs.readFile(path.join(__dirname, "lib", file));
+		sounds.push(sound);
+	}
+	if (!hasGm82snd) {
+		await newSound(sounds, "sound_chatbox8");
+		await newSound(sounds, "sound_saved8");
+		replaceChunk(exe, soundsOffsets, putAssets(exe, sounds));
+	}
+	sounds = null;
+	if(exe.readUInt32LE() != 800)
+		throw new Error("Sprites header");
+	let sprites: Array<Sprite> = getAssets(exe, Sprite.deserialize) as Array<Sprite>;
+	sprites = null;
+	if(exe.readUInt32LE() != 800)
+		throw new Error("Backgrounds header");
+	let backgrounds: Array<Background> = getAssets(exe, Background.deserialize) as Array<Background>;
+	backgrounds = null;
+	if(exe.readUInt32LE() != 800)
+		throw new Error("Paths header");
+	let paths: Array<Path> = getAssets(exe, Path.deserialize) as Array<Path>;
+	paths = null;
+	if(exe.readUInt32LE() != 800)
+		throw new Error("Scripts header");
+	const scriptsOffsets: [number, number] = [exe.readOffset, 0];
+	let scripts: Array<Script> = getAssets(exe, Script.deserialize) as Array<Script>;
+	scriptsOffsets[1] = exe.readOffset;
+	if(exe.readUInt32LE() != 800)
+		throw new Error("Fonts header");
+	const fontsOffsets: [number, number] = [exe.readOffset, 0];
+	let fonts: Array<Font> = getAssets(exe, Font.deserialize) as Array<Font>;
+	fontsOffsets[1] = exe.readOffset;
+	const newFont = async function(fonts: Array<Font>, file: string): Promise<void> {
+		const font: Font = new Font();
+		font.name = Buffer.from(file, 'ascii');
+		font.content = await fs.readFile(path.join(__dirname, "lib", file));
+		fonts.push(font);
+	}
+	await newFont(fonts, "font_online8");
+	replaceChunk(exe, fontsOffsets, putAssets(exe, fonts));
+	fonts = null;
+	if(exe.readUInt32LE() != 800)
+		throw new Error("Timelines header");
+	let timelines: Array<Timeline> = getAssets(exe, Timeline.deserialize) as Array<Timeline>;
+	timelines = null;
+	if(exe.readUInt32LE() != 800)
+		throw new Error("Objects header");
+	const objectsOffsets: [number, number] = [exe.readOffset, 0];
+	let objects: Array<GMObject> = getAssets(exe, GMObject.deserialize) as Array<GMObject>;
+	objectsOffsets[1] = exe.readOffset;
+	const world: GMObject = findAsset(objects, ["world", "World", "objWorld", "oWorld"]) as GMObject;
+	const player: GMObject = findAsset(objects, ["player", "Player", "objPlayer", "oPlayer"]) as GMObject;
+	const player2: GMObject = findAsset(objects, ["player2", "objPlayer2", "oPlayer2"]) as GMObject;
+	if(world == undefined)
+		throw new Error("No object world");
+	if(player == undefined)
+		throw new Error("No object player");
+	GMLCode.addVariables("GM8");
+	if (gameConfig.version === GameVersion.GameMaker80) {
+		GMLCode.addVariables("GM80");
+	}
+	GMLCode.addVariables("TEMPFILE");
+	if (hasGm82net)
+		GMLCode.addVariables("GMNET");
+	if (world.name.equals(Buffer.from("World", 'ascii')))
+		GMLCode.addVariables("RENEX");
+	if (hasGm82snd)
+		GMLCode.addVariables("GMSND");
+	if(player2 != undefined)
+		GMLCode.addVariables("PLAYER2");
+	// Use a specific script name to detect Nikaple's Engine
+	if(scripts.some(script => script && script.name.equals(Buffer.from("audio_togglesoundmuted", 'ascii'))))
+		GMLCode.addVariables("NIKAPLE");
+	const newIncludedfile = function(file: string): IncludedFile {
+		let includedfile = new IncludedFile();
+		includedfile.fileName = Buffer.from(file, 'ascii');
+		includedfile.sourcePath = Buffer.from("C:\\" + file, 'ascii');
+		includedfile.dataExists = true;
+		includedfile.sourceLength = fs.statSync(path.join(__dirname, "lib", file))["size"];
+		includedfile.storedInGmk = true;
+		includedfile.embeddedData = fs.readFileSync(path.join(__dirname, "lib", file));
+		includedfile.exportSettings = 0;
+		includedfile.customFolder = Buffer.from("");
+		includedfile.overwriteFile = true;
+		includedfile.freeMemory = true;
+		includedfile.removeAtEnd = true;
+		return includedfile;
+	}
+	if (hasGm82snd) {
+		if(exe.readUInt32LE() != 800)
+			throw new Error("Rooms header");
+		let rooms: Array<Room> = getAssets(exe, Room.deserialize) as Array<Room>;
+		rooms = null;
+		exe.readInt32LE(); //last_instance_id
+		exe.readInt32LE(); //last_tile_id
+		if(exe.readUInt32LE() != 800)
+			throw new Error("Included files header");
+		const includedfilesOffsets: [number, number] = [exe.readOffset, 0];
+		let includedfiles: Array<IncludedFile> = getAssetRefs(exe).map((chunk: Buffer) => { 
+			const data: SmartBuffer = SmartBuffer.fromBuffer(zlib.inflateSync(chunk));
+			return IncludedFile.deserialize(data, gameConfig);
+		}) as Array<IncludedFile>;
+		includedfilesOffsets[1] = exe.readOffset;
+		includedfiles.push(newIncludedfile("__ONLINE_sndChatbox.wav"));
+		includedfiles.push(newIncludedfile("__ONLINE_sndSaved.wav"));
+		replaceChunk(exe, includedfilesOffsets, putAssetRefs(exe, includedfiles));
+	}
+	world.addCreateCode(await GMLCode.getGML("worldCreate", Buffer.from(uniqueKey,'ascii'), Buffer.from(server,'ascii'), Buffer.from(ports.tcp.toString(), 'ascii'), Buffer.from(ports.udp.toString(),'ascii'), Buffer.from(gameName), Buffer.from(Utils.getVersion(), 'ascii')));
+	world.addEndStepCode(await GMLCode.getGML("worldEndStep", player.name, player2 ? player2.name : Buffer.from("")));
+	world.addGameEndCode(await GMLCode.getGML("worldGameEnd"));
+	const newObject = function(name: Buffer, visible: boolean, depth: number, persistent: boolean): GMObject {
+		const obj: GMObject = new GMObject();
+		obj.name = name;
+		obj.spriteIndex = -1;
+		obj.solid = false;
+		obj.visible = visible;
+		obj.depth = depth;
+		obj.persistent = persistent;
+		obj.parentIndex = -1;
+		obj.maskIndex = -1;
+		obj.events = [[], [], [], [], [], [], [], [], [], [], [], []];
+		return obj;
+	}
+	const onlinePlayer: GMObject = newObject(Buffer.from("__ONLINE_onlinePlayer", 'ascii'), false, -10, true);
+	onlinePlayer.addCreateCode(await GMLCode.getGML("onlinePlayerCreate"));
+	onlinePlayer.addEndStepCode(await GMLCode.getGML("onlinePlayerEndStep", player.name, player2 ? player2.name : Buffer.from("")));
+	onlinePlayer.addDrawCode(await GMLCode.getGML("onlinePlayerDraw"));
+	const chatbox: GMObject = newObject(Buffer.from("__ONLINE_chatbox",'ascii'), true, -11, true);
+	chatbox.addCreateCode(await GMLCode.getGML("chatboxCreate"));
+	chatbox.addEndStepCode(await GMLCode.getGML("chatboxEndStep", player.name, player2 ? player2.name : Buffer.from("")));
+	chatbox.addDrawCode(await GMLCode.getGML("chatboxDraw"));
+	const playerSaved: GMObject = newObject(Buffer.from("__ONLINE_playerSaved",'ascii'), true, -10, false);
+	playerSaved.addEndStepCode(await GMLCode.getGML("playerSavedEndStep"));
+	playerSaved.addDrawCode(await GMLCode.getGML("playerSavedDraw"));
+	objects.push(onlinePlayer);
+	objects.push(chatbox);
+	objects.push(playerSaved);
+	replaceChunk(exe, objectsOffsets, putAssets(exe, objects));
+	objects = null;
+	const saveGame: Script = findAsset(scripts, ["saveGame", "savedata_save", "scrSaveGame"]) as Script;
+	const loadGame: Script = findAsset(scripts, ["loadGame", "savedata_load", "scrLoadGame"]) as Script;
+	const saveExe: Script = findAsset(scripts, ["saveExe", "scrSaveExe"]) as Script;
+	const tempExe: Script = findAsset(scripts, ["tempExe", "scrTempExe"]) as Script;
+	if(saveGame === undefined)
+		throw new Error("No script saveGame");
+	if(loadGame == undefined)
+		throw new Error("No script loadGame");
+	saveGame.source = insertGMLScript(saveGame.source, await GMLCode.getGML("saveGame", world.name, player.name, player2 ? player2.name : Buffer.from("")));
+	loadGame.source = insertGMLScript(loadGame.source, await GMLCode.getGML("saveGame2", world.name));
+	const loadGameContent: Buffer = await GMLCode.getGML("loadGame", world.name, player.name, player2 ? player2.name : Buffer.from(""));
+	if(GMLCode.is("NIKAPLE")){
+		saveExe.source = insertGMLScript(saveExe.source, loadGameContent);
+	}else if(saveExe == undefined && tempExe == undefined){
+		loadGame.source = insertGMLScript(loadGame.source, loadGameContent);
+	}else{
+		if(tempExe !== undefined)
+			tempExe.source = insertGMLScript(tempExe.source, loadGameContent);
+		else
+			saveExe.source = insertGMLScript(saveExe.source, loadGameContent);
+	}
+	replaceChunk(exe, scriptsOffsets, putAssets(exe, scripts));
+	scripts = null;
+	exe.readOffset = encryptionStartGM80;
+	console.log("Encrypting...");
+	GM80.encrypt(exe);
+	settings.save(exe);
+	GameData.encrypt(exe, gameConfig);
+	console.log("Writing...");
+	await fs.writeFile(path.join(path.dirname(input), `${gameName}_online.exe`), exe.toBuffer());
+}
